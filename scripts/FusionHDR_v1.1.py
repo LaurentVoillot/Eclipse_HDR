@@ -1,15 +1,23 @@
 ##############################################
-# FusionHDR
+# FusionHDR v1.1 — variance minimale (MLE)
 # Fusion HDR radiométrique de poses bracketées
-# Version 1.0.0
+# Version 1.1.0 — variante expérimentale
 ##############################################
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Le script original FusionHDR.py reste inchangé — ceci est une variante
+# à part qui ajoute le mode « Variance minimale (MLE) », mis par défaut.
 #
 # Crédits
 # -------
 #   • Interface : PyQt6 / conventions VeraLux
 #   • Méthode : fusion HDR radiométrique linéaire (échelle par temps de pose)
+#   • Variance minimale : estimateur du maximum de vraisemblance,
+#     d'après Granados et al. 2010 (« Optimal HDR reconstruction with
+#     linear digital cameras ») — poids = 1/Var(radiance), modèle de
+#     bruit Var(I) = a + b·I estimé de chaque pose elle-même
+#     (courbe de transfert photonique mono-image)
 
 """
 FusionHDR — combine plusieurs poses de luminosités différentes (déjà
@@ -26,8 +34,13 @@ Principe
 --------
 Chaque pose est ramenée à une radiance commune (valeur / temps_de_pose),
 puis combinée pixel à pixel :
-  • Remplacement par seuil (défaut) — la plus longue pose non saturée gagne
+  • Remplacement par seuil — la plus longue pose non saturée gagne
   • Mélange pondéré — moyenne pondérée par l'exposition (SNR), hors saturation
+  • Variance minimale (défaut, v1.1) — poids = 1/Var(radiance) par pixel :
+    l'estimateur statistiquement optimal. Le modèle de bruit Var(I)=a+b·I
+    (lecture + photons) est mesuré automatiquement sur chaque pose ;
+    aucun réglage. Passe continûment de w∝t² (zones faibles, bruit de
+    lecture) à w∝t (zones brillantes, bruit de photons).
 
 Les images doivent être **déjà recalées** (même cadrage) et linéaires.
 L'alignement et la calibration restent à faire en amont (Siril, etc.).
@@ -66,7 +79,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ── Dark stylesheet ───────────────────────────────────────────────────────────
 DARK_SS = """
@@ -186,6 +199,49 @@ def smoothstep(lo: float, hi: float, x: np.ndarray) -> np.ndarray:
     return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
 
+# ── Modèle de bruit (mode « Variance minimale ») ─────────────────────────────────
+def estimate_noise_model(lum: np.ndarray, sat_level: float, tile: int = 64):
+    """Modèle de bruit Var(I) ≈ a + b·I estimé de l'image elle-même.
+
+    Courbe de transfert photonique « mono-image » : variance locale haute
+    fréquence (MAD², robuste) vs intensité médiane, par tuiles ; on prend
+    l'ENVELOPPE BASSE (quartile 25 %) par classe d'intensité pour ignorer la
+    variance due aux vraies structures, puis on ajuste une droite.
+    a ≈ bruit de lecture², b ≈ 1/gain (photons). Le facteur d'atténuation du
+    filtre HF est identique pour toutes les poses → il se factorise et n'a
+    aucun effet sur les poids relatifs.
+    Retourne (a, b) dans l'échelle ADU² de l'image.
+    """
+    hp = lum - gaussian_filter(lum, 2.0)
+    H, W = lum.shape
+    t = max(16, int(tile))
+    ms, vs = [], []
+    for y0 in range(0, H - t + 1, t):
+        for x0 in range(0, W - t + 1, t):
+            tl = lum[y0:y0 + t, x0:x0 + t]
+            m = float(np.median(tl))
+            if m >= sat_level:            # tuile saturée : variance écrasée
+                continue
+            hh = hp[y0:y0 + t, x0:x0 + t]
+            v = (1.4826 * float(np.median(np.abs(hh - np.median(hh))))) ** 2
+            ms.append(m); vs.append(v)
+    if len(ms) < 8:
+        return 1e-12, 0.0
+    ms = np.asarray(ms); vs = np.asarray(vs)
+    # enveloppe basse par classe d'intensité (12 classes en quantiles)
+    qs = np.quantile(ms, np.linspace(0.0, 1.0, 13))
+    bx, by = [], []
+    for i in range(12):
+        sel = (ms >= qs[i]) & (ms <= qs[i + 1])
+        if int(sel.sum()) >= 4:
+            bx.append(float(np.median(ms[sel])))
+            by.append(float(np.percentile(vs[sel], 25.0)))
+    if len(bx) < 3:
+        return max(float(np.percentile(vs, 25.0)), 1e-12), 0.0
+    b, a = np.polyfit(np.asarray(bx), np.asarray(by), 1)   # pente, ordonnée
+    return max(float(a), 1e-12), max(float(b), 0.0)
+
+
 # ── Fusion d'expositions de Mertens (2007) — pyramides laplaciennes ──────────────
 #    Rendu tone-mappé direct (façon Photomatix « Naturel ») : pas de stade
 #    linéaire → les hautes lumières (couronne interne) ne sont jamais cramées.
@@ -241,10 +297,74 @@ class HDRWorker(QThread):
             np.clip(data, 0.0, None, out=data)
         return data / float(exptime)
 
+    @staticmethod
+    def _fit_pair(x, y):
+        """Ajustement robuste y ≈ α·x + β (3 passes de sigma-clipping)."""
+        sel = np.isfinite(x) & np.isfinite(y)
+        alpha, beta = 1.0, 0.0
+        for _ in range(3):
+            if int(sel.sum()) < 100:
+                break
+            alpha, beta = np.polyfit(x[sel], y[sel], 1)
+            res = y - (alpha * x + beta)
+            med = float(np.median(res[sel]))
+            s = 1.4826 * float(np.median(np.abs(res[sel] - med)))
+            if s <= 0:
+                break
+            sel = np.abs(res - med) < 3.0 * s
+        return float(alpha), float(beta)
+
+    def _cross_calibrate(self, items, fs, sat_lo, bg_sub, bg_pct):
+        """Calibration croisée anti-bandes : corrections (gain, offset) par pose.
+
+        Les zones de fusion changent de pose dominante le long des isophotes ;
+        si les radiances I/t ne concordent pas exactement (EXIF arrondi,
+        non-linéarité près de la saturation, fond de ciel variable), chaque
+        transition laisse une MARCHE concentrique. Ici, chaque pose est
+        régressée (robuste) sur la suivante plus longue, sur leurs pixels
+        communs valides, puis les corrections sont chaînées vers la pose la
+        plus longue (référence — meilleur SNR dans la couronne faible).
+        Retourne {index: (A, B)} tel que radiance_corrigée = A·radiance + B."""
+        n = len(items)
+        order = sorted(range(n), key=lambda i: items[i][1])   # court → long
+        corr = {i: (1.0, 0.0) for i in range(n)}
+        lo_floor = 0.02 * fs                                  # au-dessus du bruit
+        A_next, B_next = 1.0, 0.0                             # référence = plus longue
+        for pos in range(len(order) - 1, 0, -1):
+            i_long, i_short = order[pos], order[pos - 1]
+            p_l, e_l = items[i_long]; p_s, e_s = items[i_short]
+            d_l, _ = load_fits(p_l); d_s, _ = load_fits(p_s)
+            v_l = max_chan(d_l); v_s = max_chan(d_s)
+            valid = ((v_l > lo_floor) & (v_l < sat_lo) &
+                     (v_s > lo_floor) & (v_s < sat_lo))
+            r_l = self._radiance(d_l, e_l, bg_sub, bg_pct)
+            r_s = self._radiance(d_s, e_s, bg_sub, bg_pct)
+            rl = max_chan(r_l)[valid].ravel()
+            rs = max_chan(r_s)[valid].ravel()
+            if rl.size > 200_000:                             # sous-échantillonnage
+                st = rl.size // 200_000
+                rl = rl[::st]; rs = rs[::st]
+            if rl.size < 500:
+                self.progress.emit(2, f"⚠ Calibration : recouvrement insuffisant "
+                                      f"{Path(p_s).name} ↔ {Path(p_l).name} — ignorée.")
+                corr[i_short] = (A_next, B_next)
+                continue
+            alpha, beta = self._fit_pair(rl, rs)              # court ≈ α·long + β
+            if not (0.5 < alpha < 2.0):                       # garde-fou
+                alpha, beta = 1.0, 0.0
+            # corrigé_court = (court − β)/α, puis correction de la pose longue
+            A = A_next / alpha
+            B = B_next - A_next * beta / alpha
+            corr[i_short] = (A, B)
+            self.progress.emit(2, f"Calibration {Path(p_s).name} ↔ {Path(p_l).name} : "
+                                  f"gain {1.0/alpha:.4f}, offset {-beta/alpha:.3g}")
+            A_next, B_next = A, B
+        return corr
+
     def run(self):
         try:
             items   = self.p["items"]          # [(path, exptime), …]
-            mode    = self.p["mode"]            # "threshold" | "weighted"
+            mode    = self.p["mode"]   # "threshold" | "weighted" | "mertens" | "mle"
             fs      = float(self.p["fs"])
             sat_hi  = self.p["sat_frac"] * fs
             sat_lo  = max(0.0, (self.p["sat_frac"] - self.p["feather"]) * fs)
@@ -256,6 +376,26 @@ class HDRWorker(QThread):
                 self.error.emit("Ajouter au moins deux poses.")
                 return
 
+            # Poses en entiers 8/16 bits ? La couronne faible (~1e-3 de la
+            # pleine échelle) n'y a que ~65 niveaux → postérisation (terrasses
+            # le long des isophotes) impossible à rattraper en aval.
+            try:
+                bps = {int(fits.getheader(p).get("BITPIX", -32)) for p, _ in items}
+                if any(b in (8, 16) for b in bps):
+                    self.progress.emit(1,
+                        "⚠ Poses en entiers 8/16 bits détectées. Passez Siril en "
+                        "32 bits (commande set32bits) et refaites conversion + "
+                        "empilement des masters — sinon la postérisation résiduelle "
+                        "persistera malgré la fusion 32 bits.")
+            except Exception:
+                pass
+
+            # Calibration croisée anti-bandes (modes radiométriques seulement)
+            corr = {i: (1.0, 0.0) for i in range(n)}
+            if self.p.get("xcal", True) and mode != "mertens":
+                self.progress.emit(2, "Calibration croisée des poses (anti-bandes)…")
+                corr = self._cross_calibrate(items, fs, sat_lo, bg_sub, bg_pct)
+
             if mode == "threshold":
                 # Tri par exposition croissante : on part de la plus courte
                 # (la moins saturée) et chaque pose plus longue remplace là où
@@ -265,6 +405,8 @@ class HDRWorker(QThread):
                 self.progress.emit(int(100*1/(n+1)), f"Base : {Path(p0).name}")
                 base, _ = load_fits(p0)
                 hdr = self._radiance(base, e0, bg_sub, bg_pct)
+                A0, B0 = corr[order[0]]
+                hdr = A0 * hdr + B0
                 for k, idx in enumerate(order[1:], start=2):
                     if self._abort:
                         return
@@ -276,6 +418,8 @@ class HDRWorker(QThread):
                     val = max_chan(data)                       # pré-radiance
                     w   = 1.0 - smoothstep(sat_lo, sat_hi, val)  # 1 si OK, 0 si saturé
                     rad = self._radiance(data, exp, bg_sub, bg_pct)
+                    Ai, Bi = corr[idx]
+                    rad = Ai * rad + Bi
                     if hdr.ndim == 3:
                         w = w[None, :, :]
                     hdr = w * rad + (1.0 - w) * hdr
@@ -332,6 +476,52 @@ class HDRWorker(QThread):
                         for ci in range(nchan)]
                 hdr = np.clip(outs[0] if nchan == 1 else np.stack(outs), 0.0, 1.0)
 
+            elif mode == "mle":
+                # Variance minimale (Granados 2010) : poids pixel = 1/Var(radiance)
+                # = t² / (a + b·I). Le modèle (a, b) est mesuré sur chaque pose.
+                # Optimal continûment : w∝t² en zone faible (bruit de lecture),
+                # w∝t en zone brillante (bruit de photons). Sans réglage.
+                short_i = min(range(n), key=lambda i: items[i][1])
+                num = den = None
+                for k, (path, exp) in enumerate(items, start=1):
+                    if self._abort:
+                        return
+                    data, _ = load_fits(path)
+                    if num is not None and data.shape != num.shape:
+                        self.error.emit(f"Dimensions différentes : {Path(path).name}")
+                        return
+                    val = max_chan(data)                       # pré-radiance (ADU)
+                    a_i, b_i = estimate_noise_model(val, sat_lo)
+                    var = a_i + b_i * np.maximum(val, 0.0)
+                    # Poids en CLOCHE (triangle de Debevec) au lieu du seuil :
+                    # chaque pixel est un mélange de plusieurs poses sur TOUTE
+                    # la dynamique → les désaccords résiduels entre poses se
+                    # fondent en dégradés au lieu de faire des marches
+                    # localisées (anti-paliers), et la pose la plus adaptée
+                    # domine naturellement (bruit réduit en zone faible).
+                    hat = (np.maximum(val, 0.0)
+                           * np.maximum(1.0 - val / max(sat_hi, 1e-9), 0.0))
+                    w = ((float(exp) ** 2) / np.maximum(var, 1e-12)) * hat
+                    if (k - 1) == short_i:
+                        w = np.maximum(w, 1e-12)   # anti-trou où tout sature
+                    rad = self._radiance(data, exp, bg_sub, bg_pct)
+                    Ai, Bi = corr[k - 1]
+                    rad = Ai * rad + Bi
+                    if data.ndim == 3:
+                        w = w[None, :, :]
+                    contrib_n = w * rad
+                    if num is None:
+                        num = contrib_n
+                        den = np.broadcast_to(w, rad.shape).astype(np.float32).copy()
+                    else:
+                        num += contrib_n
+                        den += w
+                    self.progress.emit(int(100*k/(n+1)),
+                                       f"{k}/{n}  —  {Path(path).name}  "
+                                       f"[σ² = {a_i:.3g} + {b_i:.3g}·I]")
+                den = np.where(den <= 0, 1e-12, den)
+                hdr = num / den
+
             else:  # weighted — moyenne pondérée par l'exposition, hors saturation
                 # La pose la plus courte reçoit un poids plancher : là où TOUTES
                 # les poses saturent, le résultat retombe sur elle (pas de trou noir).
@@ -349,6 +539,8 @@ class HDRWorker(QThread):
                     if (k - 1) == short_i:
                         w = np.maximum(w, 1e-6)
                     rad = self._radiance(data, exp, bg_sub, bg_pct)
+                    Ai, Bi = corr[k - 1]
+                    rad = Ai * rad + Bi
                     if data.ndim == 3:
                         w = w[None, :, :]
                     contrib_n = w * rad
@@ -366,12 +558,25 @@ class HDRWorker(QThread):
             # pixels chauds / pixels saturés jusque dans la pose la plus courte,
             # qui sinon, via le max brut, assombriraient toute l'image).
             # (Sauté pour Mertens, dont la sortie est déjà équilibrée dans [0,1].)
+            #
+            # v1.1 : au-dessus du COUDE, compression douce (tanh) au lieu de
+            # l'écrêtage dur. La couronne interne dépasse largement 0,01 % des
+            # pixels : l'ancien clip la coupait net (cœur cramé) alors que le
+            # modelé existait. knee=1.0 → écrêtage (ancien comportement).
             if norm and mode != "mertens":
                 m = float(np.percentile(hdr, 99.99))
                 if m <= 0:
                     m = float(np.max(hdr))
                 if m > 0:
-                    hdr = np.clip(hdr / m, 0.0, 1.0)
+                    v = hdr / m
+                    k = float(self.p.get("knee", 0.85))
+                    if k >= 0.999:
+                        hdr = np.clip(v, 0.0, 1.0)
+                    else:
+                        hdr = np.where(
+                            v <= k, v,
+                            k + (1.0 - k) * np.tanh((v - k) / (1.0 - k)))
+                    hdr = np.maximum(hdr, 0.0).astype(np.float32)
             self.progress.emit(100, "Fusion terminée.")
             self.done.emit(hdr.astype(np.float32))
         except Exception as e:
@@ -398,7 +603,7 @@ class FusionHDRWindow(QMainWindow):
     def __init__(self, siril):
         super().__init__()
         self.siril = siril
-        self.setWindowTitle(f"FusionHDR — v{VERSION}")
+        self.setWindowTitle(f"FusionHDR v1.1 (variance minimale) — v{VERSION}")
         self.setMinimumSize(1000, 660)
         self.setStyleSheet(DARK_SS)
 
@@ -461,7 +666,12 @@ class FusionHDRWindow(QMainWindow):
         g2.addWidget(QLabel("Mode :"), 0, 0)
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(["Remplacement par seuil", "Mélange pondéré (SNR)",
-                                "Fusion d'expositions (Mertens)"])
+                                "Fusion d'expositions (Mertens)",
+                                "Variance minimale (MLE)"])
+        self.cmb_mode.setCurrentIndex(3)          # v1.1 : MLE par défaut
+        self.cmb_mode.setToolTip(
+            "Variance minimale : poids = 1/variance du pixel (bruit de lecture\n"
+            "+ photons, mesuré sur chaque pose). Estimateur optimal, sans réglage.")
         g2.addWidget(self.cmb_mode, 0, 1)
         g2.addWidget(QLabel("Pleine échelle :"), 1, 0)
         self.cmb_fs = QComboBox()
@@ -470,13 +680,23 @@ class FusionHDRWindow(QMainWindow):
         g2.addWidget(QLabel("Seuil saturation :"), 2, 0)
         self.spn_sat = QDoubleSpinBox()
         self.spn_sat.setRange(0.50, 1.0); self.spn_sat.setSingleStep(0.01)
-        self.spn_sat.setDecimals(2); self.spn_sat.setValue(0.95)
+        self.spn_sat.setDecimals(2); self.spn_sat.setValue(0.85)
         g2.addWidget(self.spn_sat, 2, 1)
         g2.addWidget(QLabel("Transition (× éch.) :"), 3, 0)
         self.spn_feather = QDoubleSpinBox()
         self.spn_feather.setRange(0.0, 0.5); self.spn_feather.setSingleStep(0.02)
-        self.spn_feather.setDecimals(2); self.spn_feather.setValue(0.10)
+        self.spn_feather.setDecimals(2); self.spn_feather.setValue(0.20)
         g2.addWidget(self.spn_feather, 3, 1)
+        g2.addWidget(QLabel("Coude hautes lumières :"), 4, 0)
+        self.spn_knee = QDoubleSpinBox()
+        self.spn_knee.setRange(0.50, 1.0); self.spn_knee.setSingleStep(0.05)
+        self.spn_knee.setDecimals(2); self.spn_knee.setValue(0.85)
+        self.spn_knee.setToolTip(
+            "Sortie : linéaire pur en dessous du coude, compression douce\n"
+            "au-dessus (jamais d'écrêtage) → le cœur garde son modelé.\n"
+            "Plus bas = cœur plus protégé. 1,00 = écrêtage dur (ancien\n"
+            "comportement). Sans effet en mode Mertens.")
+        g2.addWidget(self.spn_knee, 4, 1)
         lv.addWidget(grp2)
 
         grp3 = QGroupBox("Options")
@@ -492,6 +712,15 @@ class FusionHDRWindow(QMainWindow):
         self.chk_norm = QCheckBox("Normaliser la sortie à [0,1]")
         self.chk_norm.setChecked(True)
         g3.addWidget(self.chk_norm, 2, 0, 1, 2)
+        self.chk_xcal = QCheckBox("Calibration croisée des poses (anti-bandes)")
+        self.chk_xcal.setChecked(True)
+        self.chk_xcal.setToolTip(
+            "Ajuste gain + offset de chaque pose sur la suivante plus longue\n"
+            "(régression robuste sur leurs pixels communs valides). Supprime\n"
+            "les marches concentriques aux transitions entre poses (EXIF\n"
+            "arrondis, non-linéarité près de la saturation, ciel variable).\n"
+            "Sans effet en mode Mertens.")
+        g3.addWidget(self.chk_xcal, 3, 0, 1, 2)
         lv.addWidget(grp3)
 
         lv.addStretch()
@@ -697,13 +926,16 @@ class FusionHDRWindow(QMainWindow):
             return
         params = {
             "items":    [(it["path"], it["exptime"]) for it in self._items],
-            "mode":     ("threshold", "weighted", "mertens")[self.cmb_mode.currentIndex()],
+            "mode":     ("threshold", "weighted", "mertens",
+                         "mle")[self.cmb_mode.currentIndex()],
             "fs":       self._full_scale(),
             "sat_frac": self.spn_sat.value(),
             "feather":  self.spn_feather.value(),
             "bg_sub":   self.chk_bg.isChecked(),
             "bg_pct":   self.spn_bg.value(),
             "normalize": self.chk_norm.isChecked(),
+            "knee":     self.spn_knee.value(),
+            "xcal":     self.chk_xcal.isChecked(),
         }
         self.btn_merge.setEnabled(False)
         self.btn_save.setEnabled(False)
@@ -737,9 +969,9 @@ class FusionHDRWindow(QMainWindow):
     def _save_load(self):
         if self._result is None:
             return
-        # Par défaut : le répertoire de travail de Siril (os.getcwd()), pas le
-        # dernier dossier des poses d'entrée → le HDR retombe là où Corona
-        # rechargera l'image courante.
+        # Par défaut : le répertoire de travail de Siril (os.getcwd() = dossier
+        # courant de Siril), et NON le dernier dossier des poses d'entrée — sinon
+        # le HDR atterrit ailleurs et on recharge le mauvais fichier dans Corona.
         default = str(Path(os.getcwd()) / "hdr_merge.fit")
         f, _ = QFileDialog.getSaveFileName(self, "Enregistrer le HDR", default,
                                            "FITS (*.fit *.fits)")
@@ -750,6 +982,15 @@ class FusionHDRWindow(QMainWindow):
             self._log(f"✓ Enregistré : {f}")
             stem = str(Path(f).with_suffix(""))
             try:
+                # Siril en 16 bits requantifierait le HDR au chargement → la
+                # couronne faible (~1e-3 de la pleine échelle) n'aurait que
+                # ~65 niveaux = postérisation. On force le 32 bits d'abord.
+                try:
+                    self.siril.cmd("set32bits")
+                    self._log("→ set32bits : Siril passé en 32 bits "
+                              "(revenir avec set16bits si besoin).")
+                except Exception:
+                    pass
                 self.siril.cmd(f'load "{stem}"')   # guillemets : chemins avec espaces
                 self.siril.log(f"FusionHDR — résultat chargé : {Path(f).name}")
                 self._log("✓ Chargé dans Siril.")

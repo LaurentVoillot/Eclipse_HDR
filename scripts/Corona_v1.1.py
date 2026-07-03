@@ -1,13 +1,19 @@
 ##############################################
-# Corona
-# Rehaussement de couronne solaire (éclipse) — RHEF / FNRGF / MGN
-# Version 3.0.0
+# Corona v1.1 — détail tangentiel (ACHF)
+# Rehaussement de couronne solaire (éclipse)
+# Version 1.1.0 — variante expérimentale (basée sur Corona 3.0.0)
 ##############################################
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
+# Le script original Corona.py reste inchangé — ceci est une variante à
+# part qui ajoute la méthode « Détail tangentiel » (ACHF simplifié).
+#
 # Crédits
 # -------
+#   • Détail tangentiel — masque flou le long des arcs de cercle, ACHF
+#     simplifié (d'après Druckmüller, Contrib. Astron. Obs. Skalnaté
+#     Pleso 2006 — méthode de ses images d'éclipse de référence)
 #   • RHEF — Radial Histogram Equalizing Filter
 #     (Gilly & Cranmer, Solar Physics 2025)
 #   • FNRGF — Fourier Normalizing Radial-Graded Filter
@@ -36,6 +42,14 @@ MGN — Multi-Scale Gaussian Normalization (Morgan & Druckmüller 2014)
     mélangé à une tonalité globale (gamma) pondérée par h. Purement local,
     sans centre ni masque.
 
+Détail tangentiel — ACHF simplifié (Druckmüller 2006) [nouveau en v1.1]
+    Masque flou calculé LE LONG des arcs de cercle (jamais en radial),
+    soustrait de l'image : seules les structures RADIALES (streamers,
+    jets, plumes polaires) ressortent, le gradient radial reste intact.
+    Exploite la géométrie connue de la couronne — ce que les filtres
+    statistiques ne font pas. Se combine bien : RHEF d'abord (aplatir),
+    recharger le résultat, puis Détail tangentiel (affûter).
+
 Entrée : l'image courante de Siril (typiquement le HDR de FusionHDR) ou
 un fichier FITS. Données supposées linéaires.
 
@@ -62,7 +76,8 @@ from pathlib import Path
 from typing import Optional
 
 from astropy.io import fits
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, label, binary_closing
+from scipy.ndimage import (gaussian_filter, gaussian_filter1d, label,
+                           binary_closing, map_coordinates)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -73,7 +88,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 
-VERSION = "3.0.0"
+VERSION = "1.1.0"
 
 DARK_SS = """
 QWidget            { background:#2b2b2b; color:#d4d4d4; font-size:11px; }
@@ -351,6 +366,49 @@ def fnrgf(lum, cx, cy, lunar_r=0.0, order=8, smooth=8.0, denoise=2.0, rmax_px=0.
     return out.astype(np.float32)
 
 
+# ── Détail tangentiel — ACHF simplifié (Druckmüller 2006) ─────────────────────────
+def tangential_detail(lum, cx, cy, lunar_r=0.0, arc_deg=8.0, strength=1.0,
+                      denoise=2.0, rmax_px=0.0):
+    """Masque flou LE LONG des arcs de cercle, soustrait de l'image.
+
+    En espace polaire (r, θ), on floute uniquement selon θ (arc de `arc_deg`
+    degrés) : le flou suit les cercles, jamais les rayons. La différence
+    I − flou_θ(I) ne contient donc QUE les structures radiales (streamers,
+    jets, plumes) — le gradient radial est intact. Coring anti-bruit :
+    |détail| < denoise·σ_n → 0. Seul le DÉTAIL est rééchantillonné
+    (polaire aller-retour) ; l'image de base reste nette au pixel près.
+    Retour : image + force × détail (échelle d'origine, ≥ 0)."""
+    a = lum.astype(np.float32)
+    H, W = a.shape
+    yy, xx = np.indices((H, W)).astype(np.float32)
+    r = np.hypot(xx - cx, yy - cy)
+    maxR = float(r.max())
+    nr = int(maxR) + 2
+    na = int(min(4096, max(720, 2.0 * np.pi * maxR)))
+    th = (2.0 * np.pi * np.arange(na, dtype=np.float32) / na)[:, None]
+    rr = np.arange(nr, dtype=np.float32)[None, :]
+    Y = cy + rr * np.sin(th)
+    X = cx + rr * np.cos(th)
+    P = map_coordinates(a, [Y, X], order=1, mode="nearest").astype(np.float32)
+    sig_th = max(1.0, na * float(arc_deg) / 360.0)
+    Pb = gaussian_filter1d(P, sig_th, axis=0, mode="wrap")   # flou angulaire pur
+    d = P - Pb
+    if denoise > 0:   # coring : sous le plancher de bruit → 0 (pas de grain remonté)
+        floor = float(denoise) * _noise_sigma(a)
+        d = np.sign(d) * np.maximum(np.abs(d) - floor, 0.0)
+    # fenêtre radiale : rien sous le limbe, extinction douce au rayon max
+    ramp = np.clip((rr - max(float(lunar_r), 0.0)) / 20.0, 0.0, 1.0)
+    if rmax_px and rmax_px > 0:
+        ramp = ramp * (1.0 - np.clip((rr - float(rmax_px)) / 20.0, 0.0, 1.0))
+    d *= ramp
+    # retour en cartésien : couture angulaire 0 = 2π par duplication de ligne
+    dp = np.vstack([d, d[:1]])
+    ang = np.arctan2(yy - cy, xx - cx)
+    ang = np.where(ang < 0, ang + 2.0 * np.pi, ang) * (na / (2.0 * np.pi))
+    det = map_coordinates(dp, [ang, r], order=1, mode="nearest").astype(np.float32)
+    return np.maximum(a + float(strength) * det, 0.0)
+
+
 # ── Image loader ──────────────────────────────────────────────────────────────
 class ImageLoadWorker(QThread):
     done  = pyqtSignal(object, int, int)
@@ -360,6 +418,7 @@ class ImageLoadWorker(QThread):
         super().__init__()
         self.siril = siril
         self.path = path
+        self.bitpix = None            # profondeur du FITS reçu (postérisation ?)
 
     def run(self):
         tmp_path = None
@@ -372,6 +431,7 @@ class ImageLoadWorker(QThread):
                 with self.siril.image_lock():
                     self.siril.cmd(f'save "{tmp.replace(os.sep, "/")}"')
             with fits.open(src) as hdul:
+                self.bitpix = int(hdul[0].header.get("BITPIX", -32))
                 raw = hdul[0].data.astype(np.float32)
             if raw.ndim == 3 and raw.shape[2] in (3, 4) and raw.shape[0] not in (3, 4):
                 raw = raw.transpose(2, 0, 1)
@@ -419,6 +479,12 @@ class MGNWorker(QThread):
                 L = fnrgf(lum, p["cx"], p["cy"], p["lunar_r"], p["order"],
                           p["smooth"], p["denoise"], p["rmax"])
                 self.progress.emit(85, "FNRGF — fini.")
+            elif p["method"] == "tangential":
+                self.progress.emit(20, "Détail tangentiel — espace polaire…")
+                L = tangential_detail(lum, p["cx"], p["cy"], p["lunar_r"],
+                                      p["arc"], p["strength"], p["denoise"],
+                                      p["rmax"])
+                self.progress.emit(85, "Détail tangentiel — fini.")
             else:
                 self.progress.emit(15, "MGN…")
                 L = mgn(lum, p["scales"], p["k"], p["gamma"], p["h"], p["denoise"],
@@ -433,11 +499,18 @@ class MGNWorker(QThread):
                 stacked = np.stack([c * ratio for c in chans]).astype(np.float32)
 
             self.progress.emit(92, "Normalisation…")
-            lo = float(np.percentile(stacked, 0.25))
-            hi = float(np.percentile(stacked, 99.75))
-            if hi <= lo:
-                hi = lo + 1e-6
-            out = np.clip((stacked - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+            if p["method"] == "tangential":
+                # Tonalité du HDR PRÉSERVÉE : division par le max, aucune
+                # remontée du point noir → le fond reste sombre et l'image
+                # part telle quelle au GHS (seul le détail a été ajouté).
+                hi = float(stacked.max())
+                out = np.clip(stacked / max(hi, 1e-6), 0.0, 1.0).astype(np.float32)
+            else:
+                lo = float(np.percentile(stacked, 0.25))
+                hi = float(np.percentile(stacked, 99.75))
+                if hi <= lo:
+                    hi = lo + 1e-6
+                out = np.clip((stacked - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
             self.progress.emit(100, "Terminé.")
             self.done.emit(out)
         except Exception as e:
@@ -519,7 +592,7 @@ class CoronaWindow(QMainWindow):
     def __init__(self, siril):
         super().__init__()
         self.siril = siril
-        self.setWindowTitle(f"Corona — v{VERSION}")
+        self.setWindowTitle(f"Corona v1.1 (détail tangentiel) — v{VERSION}")
         self.setMinimumSize(980, 660)
         self.setStyleSheet(DARK_SS)
 
@@ -557,7 +630,8 @@ class CoronaWindow(QMainWindow):
         self.cmb_method = QComboBox()
         self.cmb_method.addItems(["RHEF (auto, pour GHS)",
                                   "FNRGF (réglable)",
-                                  "MGN (multi-échelle)"])
+                                  "MGN (multi-échelle)",
+                                  "Détail tangentiel (ACHF)"])
         self.cmb_method.currentIndexChanged.connect(self._on_method_changed)
         mrow.addWidget(self.cmb_method)
         lv.addLayout(mrow)
@@ -600,6 +674,22 @@ class CoronaWindow(QMainWindow):
         self.grp_fnrgf.setVisible(False)
         lv.addWidget(self.grp_fnrgf)
 
+        # ── Groupe Détail tangentiel ──────────────────────────────────────────
+        self.grp_tang = QGroupBox("Détail tangentiel — ACHF simplifié")
+        gt = QGridLayout(self.grp_tang)
+        gt.addWidget(QLabel("Arc de flou (°) :"), 0, 0)
+        self.spn_arc = QDoubleSpinBox(); self.spn_arc.setRange(1.0, 45.0)
+        self.spn_arc.setSingleStep(1.0); self.spn_arc.setValue(8.0)
+        self.spn_arc.setToolTip("Longueur d'arc du flou circulaire. Petit = détail "
+                                "fin ; grand = structures radiales larges.")
+        gt.addWidget(self.spn_arc, 0, 1)
+        gt.addWidget(QLabel("Force :"), 1, 0)
+        self.spn_tstrength = QDoubleSpinBox(); self.spn_tstrength.setRange(0.1, 5.0)
+        self.spn_tstrength.setSingleStep(0.1); self.spn_tstrength.setValue(1.0)
+        gt.addWidget(self.spn_tstrength, 1, 1)
+        self.grp_tang.setVisible(False)
+        lv.addWidget(self.grp_tang)
+
         # ── Groupe MGN ────────────────────────────────────────────────────────
         self.grp_mgn = QGroupBox("MGN — Multi-Scale Gaussian Normalization")
         g = QGridLayout(self.grp_mgn)
@@ -637,9 +727,9 @@ class CoronaWindow(QMainWindow):
         gco.addWidget(self.chk_color, 1, 0, 1, 2)
         lv.addWidget(grp_com)
 
-        hint = QLabel("RHEF/FNRGF : centre = clic-glissé · Maj+molette = rayon lunaire · "
-                      "Ctrl+molette = rayon max (coins noirs). Rendu plat, à finir au GHS. "
-                      "RHEF = sans réglage. MGN : local, sans centre.")
+        hint = QLabel("Centre = clic-glissé · Maj+molette = rayon lunaire · Ctrl+molette = "
+                      "rayon max. RHEF = aplatir (sans réglage) → GHS. Tangentiel = affûter "
+                      "les structures radiales (combo : RHEF, recharger, puis tangentiel).")
         hint.setWordWrap(True); hint.setStyleSheet("font-size:8pt; color:#888;")
         lv.addWidget(hint)
 
@@ -693,6 +783,12 @@ class CoronaWindow(QMainWindow):
         kind = "couleur" if data.ndim == 3 else "mono"
         self.lbl_img.setText(f"{W}×{H} px · {kind}")
         self._log(f"Image {W}×{H} ({kind}) chargée.")
+        bp = getattr(self._loader, "bitpix", None)
+        if bp in (8, 16):
+            self._log("⚠ Image reçue en entiers 16 bits : la couronne faible n'a "
+                      "que peu de niveaux → postérisation possible. Passez Siril "
+                      "en 32 bits (commande set32bits) puis rechargez, ou ouvrez "
+                      "directement le FITS 32 bits de FusionHDR via « Fichier… ».")
         self._auto_center()
 
     def _show(self, disp):
@@ -710,10 +806,12 @@ class CoronaWindow(QMainWindow):
     #  Méthode & centre (NRGF)
     # =========================================================================
     def _on_method_changed(self, idx):
-        is_radial = idx in (0, 1)                # 0 = RHEF, 1 = FNRGF, 2 = MGN
+        # 0 = RHEF, 1 = FNRGF, 2 = MGN, 3 = Détail tangentiel
+        is_radial = idx in (0, 1, 3)             # méthodes qui exigent le centre
         self.grp_center.setVisible(is_radial)
         self.grp_fnrgf.setVisible(idx == 1)
         self.grp_mgn.setVisible(idx == 2)
+        self.grp_tang.setVisible(idx == 3)
         self._view.pick_enabled = is_radial
         self._draw_overlay()
 
@@ -761,7 +859,7 @@ class CoronaWindow(QMainWindow):
         for it in self._overlay:
             self._scene.removeItem(it)
         self._overlay.clear()
-        if self.data is None or self.cmb_method.currentIndex() not in (0, 1):
+        if self.data is None or self.cmb_method.currentIndex() not in (0, 1, 3):
             return
         sx = self.cx; sy = self._H - 1 - self.cy
         pen = QPen(QColor("#ff3333")); pen.setCosmetic(True); pen.setWidth(2)
@@ -785,7 +883,7 @@ class CoronaWindow(QMainWindow):
         if self.data is None:
             self._log("Aucune image.")
             return
-        method = ("rhef", "fnrgf", "mgn")[self.cmb_method.currentIndex()]
+        method = ("rhef", "fnrgf", "mgn", "tangential")[self.cmb_method.currentIndex()]
         params = {
             "method":  method,
             "denoise": self.spn_denoise.value(),
@@ -795,12 +893,15 @@ class CoronaWindow(QMainWindow):
             "k":      self.spn_k.value(),
             "gamma":  self.spn_gamma.value(),
             "h":      self.spn_h.value(),
-            # RHEF / FNRGF
+            # RHEF / FNRGF / tangentiel
             "cx": self.cx, "cy": self.cy,
             "lunar_r": float(self.spn_lunar.value()),
             "order":   self.spn_order.value(),
             "smooth":  self.spn_rsmooth.value(),
             "rmax":    float(self.spn_rmax.value()),
+            # tangentiel
+            "arc":      self.spn_arc.value(),
+            "strength": self.spn_tstrength.value(),
         }
         self.btn_apply.setEnabled(False)
         self.btn_save.setEnabled(False)
@@ -812,6 +913,10 @@ class CoronaWindow(QMainWindow):
             self._log(f"━━ FNRGF (centre {self.cx:.0f},{self.cy:.0f}, "
                       f"rayon {self.spn_lunar.value()}, ordre {self.spn_order.value()}, "
                       f"lissage {self.spn_rsmooth.value():.0f})")
+        elif method == "tangential":
+            self._log(f"━━ Détail tangentiel (centre {self.cx:.0f},{self.cy:.0f}, "
+                      f"arc {self.spn_arc.value():.0f}°, "
+                      f"force {self.spn_tstrength.value():.1f})")
         else:
             self._log(f"━━ MGN (échelles {self.cmb_scales.currentText()}, "
                       f"k={params['k']:.2g}, γ={params['gamma']:.2g}, h={params['h']:.2g})")
