@@ -12,6 +12,7 @@ Les scripts s'exécutent depuis **Siril → Scripts**, ouvrent une interface PyQ
 
 | Script | Rôle | Réutilisable au-delà de l'éclipse |
 |---|---|---|
+| [`scripts/SirilJ_Align.py`](scripts/SirilJ_Align.py) | **Alignement, deux modes.** ☼ *Soleil* : recalage **multi-points** de la surface (corrélation de phase + champ de déformation local — corrige la turbulence, qu'une transformation globale ne peut pas suivre). ☾ *Éclipse* : recalage de poses de luminosités très différentes sur le **disque lunaire**, seul repère commun (détection adaptative : disque sombre enclos, ou limbe par RANSAC pour le diamant). Charge par défaut la séquence ouverte dans Siril. → 🇫🇷 [doc](docs/SirilJ_Align_FR.md) · 🇬🇧 [doc](docs/SirilJ_Align_US.md) | ✅ solaire haute résolution (mode ☼), lunaire |
 | [`scripts/FusionHDR.py`](scripts/FusionHDR.py) | **Fusion HDR radiométrique** de poses bracketées (déjà alignées, linéaires) → FITS **32 bits** linéaire. Deux modes : *remplacement par seuil* (défaut) et *mélange pondéré SNR*. Échelle d'exposition lue dans l'en-tête ou estimée par recouvrement. | ✅ lunaire (clair de Terre, éclipse de Lune), planétaire (planète + satellites), **ciel profond** (cœur de M42…) |
 | [`scripts/Corona.py`](scripts/Corona.py) | **Révélation de la couronne** : retrait du gradient radial (profil azimutal) + filtre **Larson–Sekanina** (radial/rotationnel) + accentuation (unsharp), avec sélection du centre et masque du disque lunaire. | ❌ spécifique à la couronne solaire |
 
@@ -25,6 +26,10 @@ Guide complet de bout en bout — **prise de vue → conversion → alignement/e
 
 - 🇫🇷 [Guide FR](docs/Guide_Eclipse_HDR_FR.md)
 - 🇬🇧 [Guide US](docs/Guide_Eclipse_HDR_US.md)
+
+Documentation par outil :
+
+- **SirilJ Align** — 🇫🇷 [FR](docs/SirilJ_Align_FR.md) · 🇬🇧 [EN](docs/SirilJ_Align_US.md)
 
 ---
 
