@@ -58,7 +58,8 @@ from pathlib import Path
 from typing import Optional
 
 from astropy.io import fits
-from scipy.ndimage import gaussian_filter, shift as ndshift, label, binary_closing
+from scipy.ndimage import (gaussian_filter, shift as ndshift, label,
+                           binary_closing, map_coordinates)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -154,12 +155,22 @@ def reg_lum(data):
 def estimate_sharpness(lum):
     return float(np.var(np.diff(lum, axis=0)) + np.var(np.diff(lum, axis=1)))
 
-def save_fits(data, hdr, path):
-    """FITS float32 (BITPIX=-32), header préservé (dont EXPTIME pour FusionHDR)."""
+def save_fits(data, hdr, path, moon=None):
+    """FITS float32 (BITPIX=-32), header préservé (dont EXPTIME pour FusionHDR).
+
+    `moon` = (cx, cy, r) APRÈS recalage : écrit MOONX/MOONY/MOONR dans
+    l'en-tête. Le cercle voyage ainsi avec la donnée, mesuré sur l'image brute
+    au moment du recalage — les outils en aval (EclipseComposite, Corona) n'ont
+    plus à le redécouvrir sur une image déjà traitée, où un recadrage circulaire
+    peut les induire en erreur."""
     out = np.asarray(data, dtype=np.float32)
     h = hdr.copy()
     for kw in ("BZERO", "BSCALE", "BLANK", "DATAMAX", "DATAMIN"):
         h.remove(kw, ignore_missing=True)
+    if moon is not None:
+        h["MOONX"] = (float(moon[0]), "px, centre Lune (SirilJ Align)")
+        h["MOONY"] = (float(moon[1]), "px, centre Lune (SirilJ Align)")
+        h["MOONR"] = (float(moon[2]), "px, rayon Lune (SirilJ Align)")
     fits.PrimaryHDU(out, header=h).writeto(path, overwrite=True)
 
 def _mtf(x, m, lo, hi):
@@ -467,6 +478,97 @@ def detect_moon(lum, seed=42):
     return float(cx), float(cy), float(r), float(best_n / len(pts))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  CŒUR PARTIALITÉ — séparer le limbe solaire du limbe lunaire
+# ══════════════════════════════════════════════════════════════════════════════
+def _ransac_circle(pts, rmin, rmax, tol=2.0, iters=2000, seed=0):
+    """Cercle dominant dans un nuage de points + masque de ses inliers."""
+    rng = np.random.default_rng(seed)
+    best_n, best = 0, None
+    n_pts = len(pts)
+    for _ in range(iters):
+        i = rng.choice(n_pts, 3, replace=False)
+        c = _circumcircle(pts[i[0]], pts[i[1]], pts[i[2]])
+        if not c or not (rmin <= c[2] <= rmax):
+            continue
+        d = np.abs(np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) - c[2])
+        n = int(np.count_nonzero(d < tol))
+        if n > best_n:
+            best_n, best = n, c
+    if best is None:
+        return None, None
+    c = best
+    for _ in range(3):                       # affinage moindres carrés (Kåsa)
+        d = np.abs(np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) - c[2])
+        inl = pts[d < 3.0]
+        if len(inl) < 10:
+            break
+        c = _fit_circle_kasa(inl)
+    d = np.abs(np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) - c[2])
+    return c, d < 3.0
+
+
+def _edge_polarity(lum, c, inl_pts, delta=6.0):
+    """Luminosité juste EN DEDANS et juste EN DEHORS du cercle, aux points du
+    bord. C'est le seul discriminant fiable entre Soleil et Lune : leurs
+    diamètres apparents sont quasi identiques, le rayon ne les sépare pas.
+      • limbe SOLAIRE : disque brillant en dedans, ciel noir en dehors
+      • limbe LUNAIRE : Lune noire en dedans, disque solaire brillant en dehors
+    """
+    v = inl_pts - np.array([c[0], c[1]])
+    n = np.maximum(np.hypot(v[:, 0], v[:, 1]), 1e-9)
+    u = v / n[:, None]
+    p_in = inl_pts - u * delta
+    p_out = inl_pts + u * delta
+    s_in = map_coordinates(lum, [p_in[:, 1], p_in[:, 0]], order=1, mode="nearest")
+    s_out = map_coordinates(lum, [p_out[:, 1], p_out[:, 0]], order=1, mode="nearest")
+    return float(np.median(s_in)), float(np.median(s_out))
+
+
+def detect_partial(lum, seed=42):
+    """Phase PARTIELLE (images prises au filtre solaire) → (soleil, lune).
+
+    Chaque élément vaut (cx, cy, r) ou None. Deux passes RANSAC : le cercle
+    dominant, puis le second sur les points restants ; chacun est identifié
+    par la polarité de son bord. La Lune n'étant visible que là où elle
+    chevauche le Soleil, son arc peut être trop court en tout début ou toute
+    fin de partialité — elle ressort alors None, le Soleil restant fiable.
+    """
+    a = gaussian_filter(lum.astype(np.float32), 2.0)
+    lo = float(np.percentile(a, 1.0)); hi = float(np.percentile(a, 99.9))
+    if hi <= lo:
+        return None, None
+    an = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+    gy, gx = np.gradient(an)
+    g = np.hypot(gx, gy)
+    H, W = an.shape
+    ys, xs = np.where(g >= np.percentile(g, 99.3))
+    if len(xs) < 100:
+        return None, None
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    rng = np.random.default_rng(seed)
+    if len(pts) > 4000:
+        pts = pts[rng.choice(len(pts), 4000, replace=False)]
+    rmin, rmax = 0.05 * min(H, W), 0.48 * min(H, W)
+    sun = moon = None
+    rest = pts
+    for k in range(2):
+        if len(rest) < 60:
+            break
+        c, inl = _ransac_circle(rest, rmin, rmax, seed=seed + k)
+        if c is None:
+            break
+        s_in, s_out = _edge_polarity(an, c, rest[inl])
+        if s_in > s_out:
+            if sun is None:
+                sun = c
+        else:
+            if moon is None:
+                moon = c
+        rest = rest[~inl]
+    return sun, moon
+
+
 # ── Siril helpers ─────────────────────────────────────────────────────────────
 def get_siril_sequence(siril):
     """Détecte la séquence courante de Siril → dict ou None."""
@@ -680,17 +782,147 @@ class DetectWorker(QThread):
         self.done.emit()
 
 
+class PartialAlignWorker(QThread):
+    """Partialité : deux time-lapses en une passe, l'un centré Soleil, l'autre
+    centré Lune. La détection n'est faite qu'UNE fois par image."""
+    progress = pyqtSignal(int, str)
+    done     = pyqtSignal(int, int, int, str, str, bool)   # n_sun,n_moon,n,dS,dL,abort
+    error    = pyqtSignal(str)
+
+    def __init__(self, params, parent=None):
+        super().__init__(parent)
+        self.p = params
+        self._abort = False
+
+    def abort(self): self._abort = True
+
+    def _prepare(self, folder, base):
+        try:
+            d = Path(folder)
+            d.mkdir(parents=True, exist_ok=True)
+            for pat in (f"{base}_*.fit*", f"{base}*.seq"):
+                for old in d.glob(pat):
+                    try: old.unlink()
+                    except Exception: pass
+            return True
+        except Exception as e:
+            self.error.emit(f"Dossier {folder} : {e}")
+            return False
+
+    def run(self):
+        p = self.p
+        files = p["files"]
+        n = len(files)
+        root = Path(p["out_root"])
+        b_sun, b_moon = p["base_sun"], p["base_moon"]
+        dir_sun, dir_moon = root / b_sun, root / b_moon
+        want_sun, want_moon = p["do_sun"], p["do_moon"]
+        if want_sun and not self._prepare(dir_sun, b_sun):
+            return
+        if want_moon and not self._prepare(dir_moon, b_moon):
+            return
+
+        # ── Passe 1 : détecter Soleil et Lune sur chaque image ───────────────
+        circles = []
+        for i, path in enumerate(files):
+            if self._abort:
+                break
+            try:
+                data, _ = load_fits(path)
+                sun, moon = detect_partial(to_lum(data))
+            except Exception as e:
+                sun = moon = None
+                self.progress.emit(int(45*(i+1)/n), f"✗ {Path(path).name} : {e}")
+            circles.append((sun, moon))
+            if (i + 1) % 5 == 0 or i + 1 == n:
+                ns = sum(1 for c in circles if c[0])
+                nm = sum(1 for c in circles if c[1])
+                self.progress.emit(int(45*(i+1)/n),
+                                   f"Détection {i+1}/{n} — Soleil {ns}, Lune {nm}")
+        if self._abort:
+            self.done.emit(0, 0, n, str(dir_sun), str(dir_moon), True)
+            return
+
+        # ── Référence = position MÉDIANE : minimise le déplacement total et
+        #    reste insensible à une détection isolée fausse. ─────────────────
+        def median_centre(idx):
+            pts = [c[idx] for c in circles if c[idx] is not None]
+            if not pts:
+                return None
+            return (float(np.median([q[0] for q in pts])),
+                    float(np.median([q[1] for q in pts])))
+        ref_sun = median_centre(0)
+        ref_moon = median_centre(1)
+        if want_sun and ref_sun is None:
+            self.progress.emit(50, "⚠ Soleil détecté sur aucune image — time-lapse "
+                                   "Soleil abandonné.")
+            want_sun = False
+        if want_moon and ref_moon is None:
+            self.progress.emit(50, "⚠ Lune détectée sur aucune image — time-lapse "
+                                   "Lune abandonné. (Elle n'est visible que là où "
+                                   "elle mord le disque solaire.)")
+            want_moon = False
+        if not (want_sun or want_moon):
+            self.done.emit(0, 0, n, str(dir_sun), str(dir_moon), False)
+            return
+
+        # ── Passe 2 : décaler et écrire ─────────────────────────────────────
+        n_sun = n_moon = 0
+        for i, path in enumerate(files):
+            if self._abort:
+                break
+            sun, moon = circles[i]
+            name = Path(path).name
+            try:
+                data, hdr = load_fits(path)
+            except Exception as e:
+                self.progress.emit(50 + int(50*(i+1)/n), f"✗ {name} : {e}")
+                continue
+
+            def ecrire(centre, ref, folder, base, cnt, tag):
+                dy = ref[1] - centre[1]
+                dx = ref[0] - centre[0]
+                if data.ndim == 2:
+                    out = ndshift(data, (dy, dx), order=1, mode="constant", cval=0.0)
+                else:
+                    out = ndshift(data, (0, dy, dx), order=1, mode="constant", cval=0.0)
+                dst = str(Path(folder) / f"{base}_{cnt+1:05d}.fit")
+                save_fits(out, hdr, dst,
+                          moon=(ref[0], ref[1], centre[2]) if tag == "Lune" else None)
+                return dx, dy
+
+            msg = []
+            if want_sun and sun is not None:
+                dx, dy = ecrire(sun, ref_sun, dir_sun, b_sun, n_sun, "Soleil")
+                n_sun += 1
+                msg.append(f"Soleil Δ({dx:+.1f},{dy:+.1f})")
+            elif want_sun:
+                msg.append("Soleil non détecté")
+            if want_moon and moon is not None:
+                dx, dy = ecrire(moon, ref_moon, dir_moon, b_moon, n_moon, "Lune")
+                n_moon += 1
+                msg.append(f"Lune Δ({dx:+.1f},{dy:+.1f})")
+            elif want_moon:
+                msg.append("Lune non détectée")
+            self.progress.emit(50 + int(50*(i+1)/n),
+                               f"{i+1}/{n}  —  {name}  [{' · '.join(msg)}]")
+
+        self.done.emit(n_sun, n_moon, n, str(dir_sun), str(dir_moon), self._abort)
+
+
 class MoonAlignWorker(QThread):
     """Éclipse : recale les poses par translation (centres → référence)."""
     progress = pyqtSignal(int, str)
     done     = pyqtSignal(int, int, str)
     error    = pyqtSignal(str)
 
-    def __init__(self, items, ref_cx, ref_cy, out_dir, scale=1.0, parent=None):
+    def __init__(self, items, ref_cx, ref_cy, out_dir, scale=1.0, radius=0.0,
+                 parent=None):
         super().__init__(parent)
         self.items = items          # [{path, cx, cy}]
         self.ref_cx = ref_cx
         self.ref_cy = ref_cy
+        self.radius = float(radius)
         self.out_dir = out_dir
         self.scale = scale if scale > 0 else 1.0   # diviseur commun → sortie [0,1]
         self._abort = False
@@ -718,7 +950,10 @@ class MoonAlignWorker(QThread):
                     out = ndshift(data, (0, dy, dx), order=1, mode="constant", cval=0.0)
                 out = np.clip(out / self.scale, 0.0, 1.0)
                 dst = str(Path(self.out_dir) / f"aligned_{n_ok+1:05d}.fit")
-                save_fits(out, hdr, dst)
+                # après recalage, la Lune est au centre de référence
+                save_fits(out, hdr, dst,
+                          moon=(self.ref_cx, self.ref_cy, self.radius)
+                          if self.radius else None)
                 n_ok += 1
                 self.progress.emit(int(100*(i+1)/n),
                                    f"✓ {i+1}/{n}  —  {name}  (Δ {dx:+.1f},{dy:+.1f})")
@@ -813,6 +1048,7 @@ class AlignWindow(QMainWindow):
         self.ref_idx = 0; self.ref_fname = ""
         self._out_subdir = ""; self._out_base = "mp"; self._aps = []
         self._ref_worker = None; self._align_worker = None
+        self._partial_worker = None
         self._ap_timer = QTimer(self); self._ap_timer.setSingleShot(True)
         self._ap_timer.setInterval(350); self._ap_timer.timeout.connect(self._refresh_aps)
 
@@ -837,6 +1073,11 @@ class AlignWindow(QMainWindow):
         trow = QHBoxLayout()
         trow.addWidget(QLabel("Cible :"))
         self.cmb_target = QComboBox()
+        # Le mode « ◑ Partialité — 2 time-lapses » est MASQUÉ : son code est
+        # conservé (detect_partial, PartialAlignWorker, _build_partial_page) mais
+        # il n'a pas donné de résultat exploitable sur images réelles — la
+        # détection valide en synthétique ne tient pas sur les vraies données.
+        # Pour le réactiver : rajouter "◑ Partialité — 2 time-lapses" ci-dessous.
         self.cmb_target.addItems(["☼ Soleil — surface (multi-points)",
                                   "☾ Éclipse — Lune (inter-poses)"])
         self.cmb_target.currentIndexChanged.connect(self._on_mode_changed)
@@ -846,6 +1087,7 @@ class AlignWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_sun_page())
         self.stack.addWidget(self._build_moon_page())
+        self.stack.addWidget(self._build_partial_page())
         lv.addWidget(self.stack, 1)
         h.addWidget(left)
 
@@ -1047,8 +1289,141 @@ class AlignWindow(QMainWindow):
     # =========================================================================
     #  Bascule de mode
     # =========================================================================
+    def _build_partial_page(self):
+        page = QWidget(); lv = QVBoxLayout(page)
+        lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(6)
+
+        grp_s = QGroupBox("Séquence Siril courante")
+        sv = QVBoxLayout(grp_s)
+        self.lbl_pseq = QLabel("—"); self.lbl_pseq.setObjectName("SeqInfoKO")
+        self.lbl_pseq.setWordWrap(True)
+        sv.addWidget(self.lbl_pseq)
+        b_ref = QPushButton("⟳  Rafraîchir")
+        b_ref.clicked.connect(self._refresh_partial_seq)
+        sv.addWidget(b_ref)
+        lv.addWidget(grp_s)
+
+        grp_o = QGroupBox("Time-lapses à produire")
+        go = QGridLayout(grp_o)
+        self.chk_tl_sun = QCheckBox("☼ Centré sur le Soleil")
+        self.chk_tl_sun.setChecked(True)
+        self.chk_tl_sun.setToolTip("Le Soleil reste fixe : c'est la Lune qui défile "
+                                   "devant lui. Détection fiable de bout en bout.")
+        go.addWidget(self.chk_tl_sun, 0, 0, 1, 2)
+        self.chk_tl_moon = QCheckBox("☾ Centré sur la Lune")
+        self.chk_tl_moon.setChecked(True)
+        self.chk_tl_moon.setToolTip(
+            "La Lune reste fixe : c'est le Soleil qui défile derrière.\n"
+            "ATTENTION : la Lune n'est visible QUE là où elle mord le disque\n"
+            "solaire. En tout début et toute fin de partialité, son arc est trop\n"
+            "court pour être ajusté — ces images seront absentes du time-lapse.")
+        go.addWidget(self.chk_tl_moon, 1, 0, 1, 2)
+        go.addWidget(QLabel("Préfixe Soleil :"), 2, 0)
+        self.ed_psun = QLineEdit("sun_")
+        go.addWidget(self.ed_psun, 2, 1)
+        go.addWidget(QLabel("Préfixe Lune :"), 3, 0)
+        self.ed_pmoon = QLineEdit("moon_")
+        go.addWidget(self.ed_pmoon, 3, 1)
+        self.chk_pconv = QCheckBox("Convertir en séquences Siril")
+        self.chk_pconv.setChecked(True)
+        self.chk_pconv.setToolTip("Crée la séquence dans chaque dossier — prête pour "
+                                  "l'export en film depuis Siril.")
+        go.addWidget(self.chk_pconv, 4, 0, 1, 2)
+        lv.addWidget(grp_o)
+
+        hint = QLabel("Images de PARTIALITÉ, prises au filtre solaire (disque net sur "
+                      "ciel noir). Soleil et Lune ayant presque le même diamètre, ils "
+                      "sont distingués par la polarité de leur bord — pas par leur taille.")
+        hint.setWordWrap(True); hint.setStyleSheet("font-size:8pt; color:#888;")
+        lv.addWidget(hint)
+
+        lv.addStretch()
+        self.btn_pgo = QPushButton("▶  Aligner et produire les time-lapses")
+        self.btn_pgo.setObjectName("BtnStart")
+        self.btn_pgo.clicked.connect(self._start_partial)
+        lv.addWidget(self.btn_pgo)
+        b_ab = QPushButton("⏹  Arrêter"); b_ab.clicked.connect(self._abort_all)
+        lv.addWidget(b_ab)
+        return page
+
+    def _refresh_partial_seq(self):
+        info = get_siril_sequence(self.siril)
+        if info and info.get("single_file"):
+            self.seq_info = None
+            self.lbl_pseq.setObjectName("SeqInfoKO")
+            self.lbl_pseq.setText(f"⚠ {info['seqname']} — séquence mono-fichier "
+                                  "(FITSEQ/SER). Exportez en FITS individuels.")
+        elif not info or not info["files"]:
+            self.seq_info = None
+            self.lbl_pseq.setObjectName("SeqInfoKO")
+            self.lbl_pseq.setText("Aucune séquence chargée. Ouvrez la séquence de "
+                                  "partialité dans Siril, puis ⟳ Rafraîchir.")
+        else:
+            self.seq_info = info
+            self.lbl_pseq.setObjectName("SeqInfoOK")
+            self.lbl_pseq.setText(f"✓  {info['seqname']} — {len(info['files'])} image(s)\n"
+                                  f"📂 {info['work_dir']}")
+        self.lbl_pseq.style().unpolish(self.lbl_pseq)
+        self.lbl_pseq.style().polish(self.lbl_pseq)
+
+    def _start_partial(self):
+        if not self.seq_info or not self.seq_info["files"]:
+            self._log("⚠ Aucune séquence chargée."); return
+        do_sun = self.chk_tl_sun.isChecked()
+        do_moon = self.chk_tl_moon.isChecked()
+        if not (do_sun or do_moon):
+            self._log("Cochez au moins un time-lapse."); return
+        b_sun = (self.ed_psun.text().strip().rstrip("_") or "sun")
+        b_moon = (self.ed_pmoon.text().strip().rstrip("_") or "moon")
+        if b_sun == b_moon:
+            self._log("⚠ Les deux préfixes doivent différer."); return
+        params = {
+            "files": self.seq_info["files"],
+            "out_root": self.seq_info["work_dir"],
+            "base_sun": b_sun, "base_moon": b_moon,
+            "do_sun": do_sun, "do_moon": do_moon,
+        }
+        self.btn_pgo.setEnabled(False); self.prog.setValue(0)
+        self._log(f"━━ Partialité : {len(params['files'])} image(s), "
+                  f"{'Soleil ' if do_sun else ''}{'Lune' if do_moon else ''}")
+        siril_safe_log(self.siril, "SirilJ Align — time-lapses de partialité")
+        self._partial_worker = PartialAlignWorker(params)
+        self._partial_worker.progress.connect(
+            lambda v, m: (self.prog.setValue(v), self._log(m)))
+        self._partial_worker.done.connect(self._on_partial_done)
+        self._partial_worker.error.connect(lambda e: self._log(f"✗ {e}"))
+        self._partial_worker.finished.connect(
+            lambda: self.btn_pgo.setEnabled(True))
+        self._partial_worker.start()
+
+    def _on_partial_done(self, n_sun, n_moon, n, dir_sun, dir_moon, aborted):
+        self.prog.setValue(100)
+        if aborted:
+            self._log(f"⏹ Interrompu ({n_sun} Soleil, {n_moon} Lune sur {n}).")
+            return
+        self._log(f"✓ Terminé : {n_sun}/{n} images centrées Soleil, "
+                  f"{n_moon}/{n} centrées Lune.")
+        if n_moon and n_moon < n:
+            self._log(f"   ({n - n_moon} image(s) sans Lune exploitable — arc trop "
+                      "court en début/fin de partialité, c'est attendu.)")
+        if not self.chk_pconv.isChecked():
+            return
+        orig = os.getcwd()
+        for folder, base, cnt in ((dir_sun, self.ed_psun.text().strip().rstrip("_") or "sun", n_sun),
+                                  (dir_moon, self.ed_pmoon.text().strip().rstrip("_") or "moon", n_moon)):
+            if cnt <= 0:
+                continue
+            if siril_safe_cmd(self.siril, f'cd "{Path(folder).resolve()}"'):
+                ok = siril_safe_cmd(self.siril, "convert", base, "-fitseq")
+                if not ok:
+                    ok = siril_safe_cmd(self.siril, "convert", base)
+                self._log(f"✓ Séquence «{base}» créée." if ok
+                          else f"⚠ convert a échoué dans {Path(folder).name}.")
+        siril_safe_cmd(self.siril, f'cd "{orig}"')
+        self._log("→ Dans Siril : ouvrez la séquence voulue, puis exportez en film.")
+
     def _on_mode_changed(self, idx):
-        self.mode = "sun" if idx == 0 else "moon"
+        self.mode = ("sun", "moon", "partial")[idx]
         self.stack.setCurrentIndex(idx)
         self._view.set_pick(self.mode == "moon")
         # réinitialise l'aperçu (les conventions d'affichage diffèrent)
@@ -1057,12 +1432,18 @@ class AlignWindow(QMainWindow):
         if self.mode == "sun":
             self.lbl_ref_info.setText("Aucune référence chargée.")
             self._refresh_sequence()
-        else:
+            msg = "Mode Soleil."
+        elif self.mode == "moon":
             self.lbl_ref_info.setText("Sélectionnez une pose dans la liste.")
             if not self._items:                     # défaut : la séquence Siril courante
                 self._load_current_sequence(announce=False)
             self._refresh_table()
-        self.statusBar().showMessage("Mode Soleil." if self.mode == "sun" else "Mode Éclipse.")
+            msg = "Mode Éclipse."
+        else:
+            self.lbl_ref_info.setText("Partialité — images prises AU FILTRE solaire.")
+            self._refresh_partial_seq()
+            msg = "Mode Partialité."
+        self.statusBar().showMessage(msg)
 
     # =========================================================================
     #  ☼  SOLEIL
@@ -1236,7 +1617,8 @@ class AlignWindow(QMainWindow):
         self.btn_start.setEnabled(self.ref_lum is not None)
 
     def _abort_all(self, wait=False):
-        for w in (self._ref_worker, self._align_worker, self._detect, self._moon_align):
+        for w in (self._ref_worker, self._align_worker, self._detect,
+                  self._moon_align, self._partial_worker):
             if w and w.isRunning():
                 w.abort()
                 if wait:
@@ -1506,7 +1888,8 @@ class AlignWindow(QMainWindow):
                   f"(réf : {Path(ref['path']).name}, échelle ÷{scale:.0f})")
         self._moon_align = MoonAlignWorker(
             [{"path": it["path"], "cx": it["cx"], "cy": it["cy"]} for it in self._items],
-            ref["cx"], ref["cy"], out, scale=scale)
+            ref["cx"], ref["cy"], out, scale=scale,
+            radius=(self._radius if self._radius > 0 else ref.get("r", 0.0)))
         self._moon_align.progress.connect(lambda v, m: (self.prog.setValue(v), self._log(m)))
         self._moon_align.done.connect(self._on_moon_done)
         self._moon_align.error.connect(lambda e: (self._log(f"✗ {e}"),

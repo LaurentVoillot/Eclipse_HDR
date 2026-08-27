@@ -161,6 +161,70 @@ def to_pixmap(disp):
     h, w, _ = rgb.shape
     return QPixmap.fromImage(QImage(rgb.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888))
 
+def neutralize_corona(img, amount, balance=True):
+    """Désature la couronne en préservant le rouge Hα des protubérances.
+
+    Corona ne CRÉE pas de saturation — elle multiplie les trois canaux par le
+    même facteur, donc les rapports R:V:B sont conservés. Mais en remontant la
+    couronne faible à pleine luminosité, elle RÉVÈLE une dominante jusque-là
+    invisible. Or la couronne K est de la lumière photosphérique diffusée par
+    les électrons : elle est physiquement BLANCHE, sa teinte est un artefact.
+
+    La neutraliser maximise le RAPPORT de saturation avec les protubérances —
+    la saturation absolue, elle, se remonte ensuite d'un curseur.
+    Aucun centre n'est requis (fonctionne donc aussi en mode MGN).
+    amount : 0 = inchangé, 1 = couronne parfaitement neutre.
+    """
+    # La balance des blancs doit s'appliquer même si la désaturation est à 0 :
+    # ce sont deux réglages indépendants (retirer la dominante ≠ désaturer).
+    if img.ndim != 3 or img.shape[0] < 3 or (amount <= 1e-6 and not balance):
+        return img.astype(np.float32), (1.0, 1.0, 1.0)
+    out = img.astype(np.float32).copy()
+    lum = out.mean(axis=0)
+    # Zone de référence : la moitié la plus lumineuse (exclut disque et ciel
+    # vide, dont les rapports de couleur sont dominés par le bruit).
+    thr = float(np.percentile(lum, 50.0))
+    zone = lum > max(thr, 1e-9)
+    if int(zone.sum()) < 500:
+        zone = lum > 0
+
+    def _ratio(im):
+        """R / max(V, B) — critère ABSOLU de « vraiment rouge ».
+
+        Un seuil relatif (rougeur au-dessus de la médiane) protège tout ce qui
+        est un peu plus chaud que la moyenne : une dominante jaune passe pour
+        du Hα, garde sa saturation pendant que le reste est désaturé, et
+        ressort donc en taches jaunes au lieu de disparaître.
+        Le rapport R/max(V,B) tranche sans ambiguïté : une couronne neutre vaut
+        ~1,0 · une dominante jaune ~1,1 · une protubérance Hα de 3 à 10."""
+        return im[0] / np.maximum(np.maximum(im[1], im[2]), 1e-12)
+
+    def _hw(im):
+        t = np.clip((_ratio(im) - 1.15) / (1.35 - 1.15), 0.0, 1.0)
+        return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+    # Poids Hα calculé sur l'image D'ORIGINE, avant toute balance : celle-ci
+    # remonte le canal le plus faible (souvent le bleu) pour neutraliser la
+    # couronne, ce qui écrase le rapport R/max(V,B) des protubérances et leur
+    # ferait perdre leur protection.
+    hw = _hw(out)
+
+    gains = (1.0, 1.0, 1.0)
+    if balance:
+        neutral = zone & (hw < 0.2)                  # exclut les protubérances
+        ref = neutral if int(neutral.sum()) > 500 else zone
+        meds = [float(np.median(out[c][ref])) for c in range(3)]
+        tgt = float(np.mean(meds))
+        if all(m > 1e-9 for m in meds):
+            gains = tuple(tgt / m for m in meds)
+            for c in range(3):
+                out[c] = out[c] * gains[c]
+    s = (1.0 - float(amount) * (1.0 - hw)).astype(np.float32)
+    lum = out.mean(axis=0)
+    out = np.maximum(lum[None, :, :] + (out - lum[None, :, :]) * s[None, :, :], 0.0)
+    return out.astype(np.float32), gains
+
+
 def save_fits(data, path):
     fits.PrimaryHDU(np.asarray(data, dtype=np.float32)).writeto(path, overwrite=True)
 
@@ -498,6 +562,14 @@ class MGNWorker(QThread):
                 ratio = np.clip(L / np.maximum(lum, 1e-6), 0.0, 20.0)
                 stacked = np.stack([c * ratio for c in chans]).astype(np.float32)
 
+            if (stacked.ndim == 3 and (p.get("neutral", 0.0) > 1e-6
+                                     or p.get("neutral_wb", False))):
+                self.progress.emit(90, "Neutralisation de la couronne…")
+                stacked, g = neutralize_corona(stacked, p["neutral"],
+                                               p.get("neutral_wb", True))
+                self.progress.emit(91, f"Couronne neutralisée "
+                                       f"(balance R/V/B ×{g[0]:.3f}/{g[1]:.3f}/{g[2]:.3f}).")
+
             self.progress.emit(92, "Normalisation…")
             if p["method"] == "tangential":
                 # Tonalité du HDR PRÉSERVÉE : division par le max, aucune
@@ -510,7 +582,37 @@ class MGNWorker(QThread):
                 hi = float(np.percentile(stacked, 99.75))
                 if hi <= lo:
                     hi = lo + 1e-6
-                out = np.clip((stacked - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+                v = (stacked - lo) / (hi - lo)
+                # La sortie de MGN/RHEF/FNRGF est déjà bornée : le cramage vient
+                # UNIQUEMENT de cet étirement sur P99,75, qui écrête tout ce qui
+                # dépasse — et ce qui dépasse est justement la couronne interne.
+                # Coude doux (tanh) au lieu de l'écrêtage : le modelé est conservé.
+                k = float(p.get("knee", 0.85))
+                if k >= 0.999:
+                    out = np.clip(v, 0.0, 1.0).astype(np.float32)
+                else:
+                    out = np.clip(np.where(v <= k, v,
+                                           k + (1.0 - k) * np.tanh((v - k) / (1.0 - k))),
+                                  0.0, 1.0).astype(np.float32)
+            # ── Disque lunaire : noir pur ou gris du fond de ciel ─────────────
+            # Les méthodes radiales forcent le disque à 0. Un noir absolu au
+            # milieu d'un fond gris devient le point le plus contrasté de
+            # l'image : l'œil y va au lieu d'aller à la couronne. Le remplir au
+            # niveau du fond de ciel rend la Lune simplement silhouettée.
+            lr = float(p.get("lunar_r", 0.0))
+            if p.get("disc_grey", True) and lr > 4:
+                H0, W0 = out.shape[-2], out.shape[-1]
+                gy, gx = np.indices((H0, W0)).astype(np.float32)
+                rr = np.hypot(gx - p["cx"], gy - p["cy"])
+                lum_o = out if out.ndim == 2 else out.mean(axis=0)
+                ref = (rr > lr * 1.05) & (lum_o > 0)
+                if ref.any():
+                    lvl = float(np.percentile(lum_o[ref], 20.0))   # fond de ciel
+                    w = (1.0 - np.clip((rr - (lr - 8.0)) / 7.0, 0.0, 1.0)).astype(np.float32)
+                    ww = w if out.ndim == 2 else w[None, :, :]
+                    out = (out * (1.0 - ww) + lvl * ww).astype(np.float32)
+                    self.progress.emit(97, f"Disque lunaire ramené au niveau du "
+                                           f"fond de ciel ({lvl:.4f}).")
             self.progress.emit(100, "Terminé.")
             self.done.emit(out)
         except Exception as e:
@@ -722,9 +824,44 @@ class CoronaWindow(QMainWindow):
         self.spn_denoise.setToolTip("Plancher de bruit (× σ estimé). 0 = aucun ; "
                                     "plus haut = moins de grain dans les zones plates.")
         gco.addWidget(self.spn_denoise, 0, 1)
+        gco.addWidget(QLabel("Coude hautes lumières :"), 1, 0)
+        self.spn_knee = QDoubleSpinBox(); self.spn_knee.setRange(0.50, 1.0)
+        self.spn_knee.setSingleStep(0.05); self.spn_knee.setDecimals(2)
+        self.spn_knee.setValue(0.85)
+        self.spn_knee.setToolTip(
+            "Compression douce des hautes lumières au lieu de l'écrêtage.\n"
+            "Plus bas = couronne interne moins cramée (0,75 supprime\n"
+            "totalement l'écrêtage). 1,00 = ancien comportement.\n"
+            "Sans effet en mode Détail tangentiel (tonalité déjà préservée).")
+        gco.addWidget(self.spn_knee, 1, 1)
+        gco.addWidget(QLabel("Neutraliser la couronne :"), 2, 0)
+        self.spn_neutral = QDoubleSpinBox(); self.spn_neutral.setRange(0.0, 1.0)
+        self.spn_neutral.setSingleStep(0.1); self.spn_neutral.setValue(0.8)
+        self.spn_neutral.setToolTip(
+            "La couronne K est physiquement BLANCHE : sa teinte est un artefact,\n"
+            "que Corona rend visible en remontant la couronne faible.\n"
+            "La désaturer maximise le RAPPORT de saturation avec les\n"
+            "protubérances rouges (Hα préservé) — la saturation absolue se\n"
+            "remonte ensuite d'un curseur. 0 = inchangé · 1 = neutre.")
+        gco.addWidget(self.spn_neutral, 2, 1)
+        self.chk_wb = QCheckBox("Retirer la dominante (balance des blancs)")
+        self.chk_wb.setChecked(True)
+        self.chk_wb.setToolTip("Égalise les canaux sur la couronne, en excluant les "
+                               "pixels rouges pour ne pas blanchir les protubérances.")
+        gco.addWidget(self.chk_wb, 3, 0, 1, 2)
+        self.chk_disc = QCheckBox("Disque lunaire au niveau du fond (pas noir)")
+        self.chk_disc.setChecked(True)
+        self.chk_disc.setToolTip(
+            "Les méthodes radiales forcent le disque à noir pur. Au milieu d'un\n"
+            "fond gris, ce noir absolu devient le point le plus contrasté de\n"
+            "l'image et capte le regard au détriment de la couronne.\n"
+            "Coché : le disque est ramené au niveau du fond de ciel — la Lune est\n"
+            "simplement silhouettée, comme à l'œil nu.\n"
+            "Décoché : noir pur (comportement d'origine).")
+        gco.addWidget(self.chk_disc, 4, 0, 1, 2)
         self.chk_color = QCheckBox("Préserver la couleur")
         self.chk_color.setChecked(True)
-        gco.addWidget(self.chk_color, 1, 0, 1, 2)
+        gco.addWidget(self.chk_color, 5, 0, 1, 2)
         lv.addWidget(grp_com)
 
         hint = QLabel("Centre = clic-glissé · Maj+molette = rayon lunaire · Ctrl+molette = "
@@ -887,6 +1024,10 @@ class CoronaWindow(QMainWindow):
         params = {
             "method":  method,
             "denoise": self.spn_denoise.value(),
+            "knee":    self.spn_knee.value(),
+            "neutral":    self.spn_neutral.value(),
+            "neutral_wb": self.chk_wb.isChecked(),
+            "disc_grey":  self.chk_disc.isChecked(),
             "color":   self.chk_color.isChecked(),
             # MGN
             "scales": SCALE_PRESETS[self.cmb_scales.currentText()],
