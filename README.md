@@ -28,14 +28,16 @@ Les scripts s'exécutent depuis **Siril → Scripts**, ouvrent une interface PyQ
 
 ## Guides
 
-Guide complet de bout en bout — **prise de vue → conversion → alignement/empilement par exposition → fusion HDR → couronne → finition** — incluant les **précautions de sécurité oculaire** (filtre retiré à C2 / remis à C3) :
+**Procédure complète** — de la prise de vue à l'image finale : conversion, alignement et
+empilement par exposition, fusion HDR, révélation de la couronne, finition. Inclut les
+**précautions de sécurité oculaire** (filtre retiré à C2 / remis à C3), le dépannage, et
+une annexe décrivant l'effet de chaque réglage de chaque écran.
 
-- 🇫🇷 [Guide FR](docs/Guide_Eclipse_HDR_FR.md)
-- 🇬🇧 [Guide US](docs/Guide_Eclipse_HDR_US.md)
+- 🇫🇷 [Procédure complète FR](docs/Procedure_Complete_FR.md)
+- 🇬🇧 [Full procedure EN](docs/Procedure_Complete_US.md)
 
 Documentation par outil :
 
-- **Procédure complète** (RAW → image finale, 7 phases + dépannage + annexe de tous les réglages) — 🇫🇷 [FR](docs/Procedure_Complete_FR.md) · 🇬🇧 [EN](docs/Procedure_Complete_US.md)
 - **SirilJ Align** — 🇫🇷 [FR](docs/SirilJ_Align_FR.md) · 🇬🇧 [EN](docs/SirilJ_Align_US.md)
 
 ---
@@ -76,8 +78,13 @@ RAW bracketé → ConvertParVitesse (tri par vitesse + dématriçage)
 
 ## Crédits
 
-- Filtre **Larson–Sekanina** (gradient radial/rotationnel) ; méthode **Druckmüller** (NAFE/ACC) comme inspiration du rehaussement de couronne.
-- Bibliothèques : numpy, astropy, scipy, PyQt6.
+- **RHEF** — Radial Histogram Equalizing Filter (Gilly & Cranmer, *Solar Physics* 2025)
+- **FNRGF** — Fourier Normalizing Radial-Graded Filter (Druckmüllerová, Morgan & Habbal, *ApJ* 2011)
+- **MGN** — Multi-Scale Gaussian Normalization (Morgan & Druckmüller, *Solar Physics* 2014)
+- **ACHF** / détail tangentiel — d'après Druckmüller (*Contrib. Astron. Obs. Skalnaté Pleso* 2006)
+- **Variance minimale** — Granados et al. 2010, reconstruction HDR optimale
+- Filtre **Larson–Sekanina** (gradient radial/rotationnel), dans `Corona.py` d'origine
+- Bibliothèques : numpy, astropy, scipy, opencv-python, exifread, PyQt6
 
 ## Licence
 

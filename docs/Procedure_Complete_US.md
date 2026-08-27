@@ -2,9 +2,20 @@
 
 **Siril + Python scripts**, from RAW conversion through to the final stretch.
 
-> ⚠️ **Safety** — outside totality, a certified solar filter on the optics and ISO 12312-2
-> glasses for your eyes, at all times. See the safety section of the
-> [Eclipse HDR guide](Guide_Eclipse_HDR_US.md), to be read **before** eclipse day.
+## ⚠ Safety — eyes & gear (read first)
+
+**Outside totality, the Sun is dangerous to both your eyes and your sensor.** The photosphere is visible during every partial phase (before C2, after C3): looking at it — or pointing an optic at it — without protection causes **irreversible, painless retinal burns**, and can destroy the sensor or start a fire.
+
+| Phase | Eyes | Optics / camera |
+|---|---|---|
+| **Partial phases** (before C2, after C3) | **Certified ISO 12312-2 eclipse glasses** only. Never with the naked eye, nor through a viewfinder / binoculars / telescope without a filter. | **Certified solar filter** (e.g. Baader AstroSolar) **in front** of the lens, at all times. |
+| **Totality** (between C2 and C3, **only**) | Naked-eye viewing **allowed** — the only safe moment. | Shooting **without a filter** allowed. |
+
+- **At C2 / end of the diamond ring**: remove the filter **only** once Baily's beads and the diamond ring are gone and totality is fully established.
+- **At C3 / reappearance of the diamond ring**: the photosphere returns **suddenly**. **Put the filter back and stop all direct viewing the instant the diamond ring reappears** — do not wait: a fraction of a second can injure.
+- Know your precise **contact times (C2, C3)**, keep the filter **ready to refit**, and warn everyone present. When in doubt: **filter on**.
+
+> Eclipse glasses protect **your eyes**, not the camera; the lens filter protects **the camera**, not your eyes if you look elsewhere. Both are required during the partial phases.
 
 > The scripts' user interface is in French. This guide gives the English meaning of every
 > control, with the on-screen label in *italics*.

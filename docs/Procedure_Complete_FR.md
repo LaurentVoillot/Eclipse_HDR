@@ -2,9 +2,22 @@
 
 **Chaîne Siril + scripts Python**, de la conversion des RAW jusqu'à l'étirement final.
 
-> ⚠️ **Sécurité** — en dehors de la totalité, filtre solaire certifié sur l'optique et
-> lunettes ISO 12312-2 pour les yeux, en permanence. Voir la section sécurité du
-> [Guide Eclipse HDR](Guide_Eclipse_HDR_FR.md), à lire **avant** le jour J.
+---
+
+## ⚠ Sécurité — vue & matériel (à lire en premier)
+
+**En dehors de la totalité, le Soleil reste dangereux pour les yeux et le capteur.** La photosphère est visible pendant toutes les phases partielles (avant C2, après C3) : la regarder — ou la viser — sans protection cause des **brûlures rétiniennes irréversibles et indolores**, et peut détruire le capteur ou provoquer un incendie.
+
+| Moment | Yeux | Optique / appareil |
+|---|---|---|
+| **Phases partielles** (avant C2, après C3) | **Lunettes éclipse certifiées ISO 12312-2** uniquement. Jamais à l'œil nu, ni dans un viseur / des jumelles / un télescope sans filtre. | **Filtre solaire certifié** (ex. Baader AstroSolar) **devant** l'objectif, en permanence. |
+| **Totalité** (entre C2 et C3, **seulement**) | Observation à l'œil nu **autorisée** — c'est le seul moment. | Photo **sans filtre** autorisée. |
+
+- **À C2 / fin du diamant** : retirez le filtre **seulement** une fois les grains de Baily et le diamant disparus, totalité pleinement installée.
+- **À C3 / réapparition du diamant** : la photosphère revient **brutalement**. **Remettez le filtre et cessez toute observation directe à l'instant où le diamant réapparaît** — n'attendez pas : une fraction de seconde suffit à blesser.
+- Connaissez vos **horaires de contact (C2, C3)** précis, gardez le filtre **prêt à remettre**, et prévenez toute personne présente. En cas de doute : **filtre en place**.
+
+> Les lunettes éclipse protègent **les yeux**, pas l'appareil ; le filtre d'objectif protège **l'appareil**, pas vos yeux si vous regardez ailleurs. Les deux sont nécessaires pendant les phases partielles.
 
 ---
 
