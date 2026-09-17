@@ -27,6 +27,31 @@ Les scripts s'exécutent depuis **Siril → Scripts**, ouvrent une interface PyQ
 
 ---
 
+## Programme autonome — `eclipse-hdr` *(phase 1)*
+
+Une **seconde voie**, sans Siril : tous les RAW dans un dossier, un pipeline en étapes
+indépendantes, un TIFF 32 bits linéaire à chaque étape, et un export 16 bits à tout
+moment pour Photoshop, DxO ou Affinity. Chaque étape est lançable seule,
+interruptible et reprenable — le dossier projet porte son propre journal de bord.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/eclipse-hdr scan   ~/totalite     # inventaire par vitesse (EXIF seuls)
+.venv/bin/eclipse-hdr decode ~/totalite     # RAW → linéaire + masque de saturation
+.venv/bin/eclipse-hdr stack  ~/totalite     # un master par vitesse
+.venv/bin/eclipse-hdr export 03_stack/master_1-160.tif -o pour_photoshop.tif
+```
+
+Inventaire, décodage, empilement et export **fonctionnent et sont validés sur RAW
+réels** ; l'empilement a été comparé à Siril 1.4.4 sur les mêmes données (médiane
+exacte au bit près, percentile : 1 pixel divergent sur 2 880 000). Alignement,
+fusion HDR, couronne, composition et interface graphique restent à porter.
+
+- 🇫🇷 [Programme autonome FR](docs/Programme_Autonome_FR.md)
+- 🇬🇧 [Standalone program EN](docs/Programme_Autonome_US.md)
+
+---
+
 ## Guides
 
 **Procédure complète** — de la prise de vue à l'image finale : conversion, alignement et
