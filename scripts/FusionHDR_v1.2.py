@@ -336,7 +336,7 @@ def estimate_noise_model(lum: np.ndarray, sat_level: float, tile: int = 64):
     return max(float(a), 1e-12), max(float(b), 0.0)
 
 
-# ── Détection du disque lunaire (mode Zones) — cf. Corona/EclipseAlign ───────────
+# ── Détection du disque lunaire (mode Zones) — cf. Corona/SirilJ_Align ──────────
 def _otsu(v):
     vmin, vmax = float(v.min()), float(v.max())
     if vmax <= vmin:
