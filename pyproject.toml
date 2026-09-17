@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eclipse-hdr"
+version = "0.1.0"
+description = "Traitement HDR d'éclipse solaire, du RAW à l'image finale — sans Siril"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Laurent Voillot" }]
+keywords = ["astrophotography", "solar eclipse", "HDR", "corona", "raw"]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    # headless : le paquet opencv-python embarque Qt et entre en conflit
+    # avec PyQt6 dans le même processus.
+    "opencv-python-headless>=4.8",
+    "rawpy>=0.19",
+    "tifffile>=2023.7.10",
+    "imagecodecs>=2023.7.10",   # compression zlib des TIFF
+    "exifread>=3.0",
+    "astropy>=5.3",             # interopérabilité FITS avec Siril
+]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.5"]
+
+[project.scripts]
+eclipse-hdr = "eclipse_hdr.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/LaurentVoillot/Eclipse_HDR"
+
+[tool.setuptools]
+packages = ["eclipse_hdr"]
