@@ -15,6 +15,7 @@ Les scripts s'exécutent depuis **Siril → Scripts**, ouvrent une interface PyQ
 | [`scripts/SirilJ_Align.py`](scripts/SirilJ_Align.py) | **Alignement, deux modes.** ☼ *Soleil* : recalage **multi-points** de la surface (corrélation de phase + champ de déformation local — corrige la turbulence, qu'une transformation globale ne peut pas suivre). ☾ *Éclipse* : recalage de poses de luminosités très différentes sur le **disque lunaire**, seul repère commun (détection adaptative : disque sombre enclos, ou limbe par RANSAC pour le diamant). Charge par défaut la séquence ouverte dans Siril. → 🇫🇷 [doc](docs/SirilJ_Align_FR.md) · 🇬🇧 [doc](docs/SirilJ_Align_US.md) | ✅ solaire haute résolution (mode ☼), lunaire |
 | [`scripts/ConvertParVitesse.py`](scripts/ConvertParVitesse.py) | **Conversion RAW → FITS triés par vitesse.** Lit les EXIF sans rien convertir, affiche le plan de rangement, puis crée un sous-dossier par vitesse (1/160 s → `1-160`) avec les FITS dématriçés et la séquence. Les RAW ne sont ni copiés ni déplacés (liens temporaires). | ✅ toute série bracketée |
 | [`scripts/FusionHDR_v1.2.py`](scripts/FusionHDR_v1.2.py) | **Variante expérimentale de FusionHDR.** Mode *Zones non saturées* : masque de saturation + marge + fondu **spatial** (le relais entre poses se fait loin de la saturation → pas de paliers). Masque lunaire continu, superposition des protubérances sans halo, coude doux en hautes lumières, calibration croisée. | ✅ idem FusionHDR |
+| [`scripts/FusionHDR_v1.1.py`](scripts/FusionHDR_v1.1.py) | **Variante expérimentale de FusionHDR.** Mode *Variance minimale (MLE)* : poids = 1/Var(radiance) par pixel, l'estimateur statistiquement optimal, avec un modèle de bruit `Var(I) = a + b·I` estimé sur chaque pose elle-même (d'après Granados et al. 2010). Approche **distincte** de la v1.2, qui opère spatialement — les deux sont comparables sur les mêmes données. | ✅ idem FusionHDR |
 | [`scripts/Corona_v1.1.py`](scripts/Corona_v1.1.py) | **Variante expérimentale de Corona.** Ajoute le *Détail tangentiel* (ACHF, flou le long des arcs — le seul exploitable sur champ bruité), le coude hautes lumières, la neutralisation de la couronne à Hα préservé, et le disque lunaire au niveau du fond. | ❌ couronne solaire |
 | [`scripts/EclipseComposite.py`](scripts/EclipseComposite.py) | **Composition par couches** *(v0.1, esthétique assumée)* : Lune (clair de Terre), protubérances à sélectivité Hα, étoiles. | ❌ éclipse |
 | [`scripts/FusionHDR.py`](scripts/FusionHDR.py) | **Fusion HDR radiométrique** de poses bracketées (déjà alignées, linéaires) → FITS **32 bits** linéaire. Deux modes : *remplacement par seuil* (défaut) et *mélange pondéré SNR*. Échelle d'exposition lue dans l'en-tête ou estimée par recouvrement. | ✅ lunaire (clair de Terre, éclipse de Lune), planétaire (planète + satellites), **ciel profond** (cœur de M42…) |
@@ -39,6 +40,21 @@ une annexe décrivant l'effet de chaque réglage de chaque écran.
 Documentation par outil :
 
 - **SirilJ Align** — 🇫🇷 [FR](docs/SirilJ_Align_FR.md) · 🇬🇧 [EN](docs/SirilJ_Align_US.md)
+
+Les autres scripts sont documentés dans la procédure complète : chaque phase décrit
+son outil, et l'**annexe** détaille l'effet de chaque réglage de chaque écran.
+
+---
+
+## Voir aussi
+
+Les outils d'**analyse et de mesure** pour Siril (mesures interactives, comptage de
+particules, relief 3D, planche-contact, animation) sont dans le dépôt
+**[SirilJ](https://github.com/LaurentVoillot/SirilJ)**.
+
+> `SirilJ_Align.py` porte le préfixe « SirilJ » mais vit **ici** : c'est lui qui aligne
+> sur le **disque lunaire**. Le `SirilJ_SolarAlign.py` du dépôt SirilJ est l'aligneur
+> solaire d'origine, sans mode Lune.
 
 ---
 
